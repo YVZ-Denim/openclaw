@@ -2,7 +2,7 @@ name: Build OpenClaw
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "onlymain" ]
 
 jobs:
   build:
