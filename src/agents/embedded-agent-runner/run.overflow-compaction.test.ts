@@ -47,6 +47,7 @@ import {
   mockedRunEmbeddedAttempt,
   mockedSessionLikelyHasOversizedToolResults,
   mockedTruncateOversizedToolResultsInSession,
+  mockedWaitForDeferredTurnMaintenanceForSession,
   overflowBaseRunParams,
   resetRunOverflowCompactionHarnessMocks,
 } from "./run.overflow-compaction.harness.js";
@@ -236,6 +237,16 @@ function expectRuntimePlanFields(
   }
 }
 
+async function waitForRunEvent(events: string[], expected: string): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (events.includes(expected)) {
+      return;
+    }
+    await Promise.resolve();
+  }
+  throw new Error(`Expected run event ${expected}; saw ${events.join(", ")}`);
+}
+
 describe("runEmbeddedAgent overflow compaction trigger routing", () => {
   beforeAll(async () => {
     ({ runEmbeddedAgent } = await loadRunOverflowCompactionHarness());
@@ -273,6 +284,33 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
     });
   });
 
+  it("reports hook-selected models as normal selected models, not fallbacks", async () => {
+    mockedGlobalHookRunner.hasHooks.mockImplementation(
+      (hookName) => hookName === "before_model_resolve",
+    );
+    mockedGlobalHookRunner.runBeforeModelResolve.mockResolvedValueOnce({
+      providerOverride: "openai",
+      modelOverride: "hook-selected-model",
+    });
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
+
+    await runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      provider: "anthropic",
+      model: "initial-model",
+      runId: "run-before-model-resolve-runtime-settings",
+    });
+
+    expect(mockedGlobalHookRunner.runBeforeModelResolve).toHaveBeenCalledTimes(1);
+    expectMockCallFields(mockedRunEmbeddedAttempt, {
+      provider: "openai",
+      modelId: "hook-selected-model",
+      requestedModelId: "hook-selected-model",
+      fallbackActive: false,
+      fallbackReason: null,
+    });
+  });
+
   it("passes resolved auth profile into run attempts for context-engine afterTurn propagation", async () => {
     mockedRunEmbeddedAttempt.mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
 
@@ -284,6 +322,73 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
       authProfileId: "test-profile",
       authProfileIdSource: "auto",
     });
+  });
+
+  it("waits for same-session deferred maintenance before the attempt reads session state", async () => {
+    const events: string[] = [];
+    mockedWaitForDeferredTurnMaintenanceForSession.mockImplementationOnce(async (sessionKey) => {
+      events.push(`wait:${sessionKey}`);
+    });
+    mockedRunEmbeddedAttempt.mockImplementationOnce(async () => {
+      events.push("attempt");
+      return makeAttemptResult({ promptError: null });
+    });
+
+    await runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      runId: "run-wait-deferred-maintenance",
+      sessionKey: "agent:main:session-wait-deferred-maintenance",
+    });
+
+    expect(events).toEqual(["wait:agent:main:session-wait-deferred-maintenance", "attempt"]);
+  });
+
+  it("does not hold the global run lane while waiting for another session's deferred maintenance", async () => {
+    const events: string[] = [];
+    let releaseSessionA: (() => void) | undefined;
+    mockedWaitForDeferredTurnMaintenanceForSession.mockImplementation(async (sessionKey) => {
+      events.push(`wait:${sessionKey}`);
+      if (sessionKey !== "agent:main:session-a") {
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        releaseSessionA = resolve;
+      });
+    });
+    mockedRunEmbeddedAttempt.mockImplementation(async (params) => {
+      events.push(`attempt:${(params as { sessionKey?: string }).sessionKey}`);
+      return makeAttemptResult({ promptError: null });
+    });
+
+    const sessionARun = runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      runId: "run-deferred-maintenance-session-a",
+      sessionKey: "agent:main:session-a",
+    });
+    await waitForRunEvent(events, "wait:agent:main:session-a");
+
+    await runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      runId: "run-deferred-maintenance-session-b",
+      sessionKey: "agent:main:session-b",
+    });
+
+    expect(events).toEqual([
+      "wait:agent:main:session-a",
+      "wait:agent:main:session-b",
+      "attempt:agent:main:session-b",
+    ]);
+    if (!releaseSessionA) {
+      throw new Error("Expected session A maintenance release callback to be initialized");
+    }
+    releaseSessionA();
+    await sessionARun;
+    expect(events).toEqual([
+      "wait:agent:main:session-a",
+      "wait:agent:main:session-b",
+      "attempt:agent:main:session-b",
+      "attempt:agent:main:session-a",
+    ]);
   });
 
   it("uses the lightweight auth profile store during reply startup", async () => {
@@ -1030,6 +1135,7 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
     mockedGetApiKeyForModel.mockRejectedValueOnce(new Error("generic auth should be skipped"));
     const codexAuthStore = {
       version: 1,
+      runtimePersistedProfileIds: ["anthropic:work", "openai:other", "openai:work", "xai:work"],
       profiles: {
         "openai:work": {
           type: "oauth" as const,
@@ -1109,6 +1215,9 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
     const forwardedAuthStore = expectRecordFields(harnessParams.authProfileStore, {});
     const authProfiles = expectRecordFields(forwardedAuthStore.profiles, {});
     expect(Object.keys(authProfiles)).toEqual(["openai:work"]);
+    expect(forwardedAuthStore.runtimePersistedProfileIds).toEqual(["openai:work"]);
+    expect(forwardedAuthStore.runtimeExternalProfileIds).toBeUndefined();
+    expect(forwardedAuthStore.runtimeExternalProfileIdsAuthoritative).toBeUndefined();
     expectRecordFields(authProfiles["openai:work"], {
       provider: "openai",
     });
@@ -1216,6 +1325,7 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
     });
     const codexAuthStore = {
       version: 1 as const,
+      runtimePersistedProfileIds: ["openai:work"],
       profiles: {
         "openai:work": {
           type: "oauth" as const,
@@ -1311,6 +1421,8 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
     });
     const codexAuthStore = {
       version: 1 as const,
+      runtimePersistedProfileIds: ["xai:work"],
+      runtimeExternalProfileIds: ["openai:default"],
       profiles: {
         "openai:default": {
           type: "oauth" as const,
@@ -1431,6 +1543,9 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
     const forwardedAuthStore = expectRecordFields(harnessParams.authProfileStore, {});
     const authProfiles = expectRecordFields(forwardedAuthStore.profiles, {});
     expect(Object.keys(authProfiles)).toEqual(["openai:default"]);
+    expect(forwardedAuthStore.runtimePersistedProfileIds).toBeUndefined();
+    expect(forwardedAuthStore.runtimeExternalProfileIds).toEqual(["openai:default"]);
+    expect(forwardedAuthStore.runtimeExternalProfileIdsAuthoritative).toBeUndefined();
     expectRecordFields(authProfiles["openai:default"], {
       provider: "openai",
     });
@@ -2383,6 +2498,7 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
         onSessionIdChanged,
       });
 
+      const compactParams = expectMockCallFields(mockedCompactDirect, {});
       expectMockCallFields(
         mockedRunEmbeddedAttempt,
         {
@@ -2391,9 +2507,17 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
         },
         1,
       );
-      expectMockCallFields(mockedRunContextEngineMaintenance, {
+      const maintenanceParams = expectMockCallFields(mockedRunContextEngineMaintenance, {
         sessionId: "rotated-session",
         sessionFile: "/tmp/rotated-session.json",
+      });
+      expect(maintenanceParams.runtimeSettings).toBe(compactParams.runtimeSettings);
+      const runtimeSettings = expectRecordFields(maintenanceParams.runtimeSettings, {});
+      expectRecordFields(runtimeSettings.runtime, {
+        mode: "degraded",
+      });
+      expectRecordFields(runtimeSettings.diagnostics, {
+        degradedReason: "context_overflow",
       });
       expect(replyOperation.sessionId).toBe("rotated-session");
       expect(onSessionIdChanged).toHaveBeenCalledWith("rotated-session");
@@ -2536,6 +2660,14 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
     });
 
     mockedRunEmbeddedAttempt.mockResolvedValue(makeAttemptResult({ promptError }));
+    mockedEnsureAuthProfileStoreWithoutExternalProfiles.mockReturnValue({
+      profiles: {
+        "test-profile": {
+          provider: "anthropic",
+          type: "oauth",
+        },
+      },
+    });
     mockedCoerceToFailoverError.mockReturnValue(normalized);
     mockedDescribeFailoverError.mockImplementation((err: unknown) => ({
       message: err instanceof Error ? err.message : String(err),
@@ -2565,6 +2697,7 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
       provider: "anthropic",
       model: "test-model",
       profileId: "test-profile",
+      authMode: "oauth",
     });
     expect(mockedResolveFailoverStatus).toHaveBeenCalledWith("rate_limit");
   });
